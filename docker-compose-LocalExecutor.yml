@@ -27,6 +27,7 @@ services:
             - AIRFLOW_CONN_POSTGRES_DEFAULT=postgres://airflow:airflow@postgres:5432/airflow
             - FERNET_KEY=46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=
             - AWS_SHARED_CREDENTIALS_FILE=/usr/local/airflow/.aws/credentials
+            
         logging:
             options:
                 max-size: 10m
