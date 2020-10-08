@@ -1,5 +1,6 @@
 import os
 import json
+import psycopg2
 
 from datetime import datetime, timedelta 
 from airflow import DAG
@@ -9,6 +10,7 @@ from airflow.hooks.S3_hook import S3Hook
 from airflow.operators import PythonOperator
 from airflow.contrib.operators.emr_add_steps_operator import EmrAddStepsOperator
 from airflow.contrib.sensors.emr_step_sensor import EmrStepSensor
+from airflow.hooks.postgres_hook import PostgresHook
 
 # local config
 unload_user_purchase ='/scripts/sql/filter_unload_user_purchase.sql'
@@ -18,12 +20,14 @@ movie_review_local = '/data/movie_review/movie_review.csv'
 movie_clean_emr_steps = './dags/scripts/emr/clean_movie_review.json'
 movie_text_classification_script = './dags/scripts/spark/random_text_classification.py'
 
+get_user_behaviour = 'scripts/sql/get_user_behavior_metrics.sql'
+
 # remote config
 BUCKET_NAME = 'etl-data-store'
 temp_filtered_user_purchase_key= 'user_purchase/stage/{{ ds }}/temp_filtered_user_purchase.csv'
 movie_review_load = 'movie_review/load/movie.csv'
 
-EMR_ID = 'j-2DCIUIOK8CYQF'
+EMR_ID = 'j-1XV8UAI9XACNC'
 movie_review_load_folder = 'movie_review/load/'
 movie_review_stage = 'movie_review/stage/'
 text_classifier_script = 'scripts/random_text_classifier.py'
@@ -40,6 +44,15 @@ def remove_local_file(filelocation):
     else:
         logging.info(f'File {filelocation} not found')
 
+def run_redshift_external_query(qry):
+    rs_hook = PostgresHook(postgres_conn_id='redshift')
+    rs_conn = rs_hook.get_conn()
+    rs_conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+    rs_cursor = rs_conn.cursor()
+    rs_cursor.execute(qry)
+    rs_cursor.close()
+    rs_conn.commit()
+
 default_args = { 
     "owner": "airflow",
     "depends_on_past": True,
@@ -54,36 +67,36 @@ default_args = {
 
 dag = DAG("user_behaviour", default_args=default_args, schedule_interval="0 0 * * *", max_active_runs=1)
 
-# end_of_data_pipeline = DummyOperator(task_id='end_of_data_pipeline', dag=dag)
+end_of_data_pipeline = DummyOperator(task_id='end_of_data_pipeline', dag=dag)
 
-# pg_unload = PostgresOperator(
-#     dag=dag,
-#     task_id='pg_unload',
-#     sql=unload_user_purchase,
-#     postgres_conn_id='postgres_default',
-#     params={'temp_filtered_user_purchase': temp_filtered_user_purchase},
-#     depends_on_past=True,
-#     wait_for_downstream=True
-# )
+pg_unload = PostgresOperator(
+    dag=dag,
+    task_id='pg_unload',
+    sql=unload_user_purchase,
+    postgres_conn_id='postgres_default',
+    params={'temp_filtered_user_purchase': temp_filtered_user_purchase},
+    depends_on_past=True,
+    wait_for_downstream=True
+)
 
-# user_purchase_to_s3_stage = PythonOperator(
-#     dag=dag,
-#     task_id='user_purchase_to_s3_stage',
-#     python_callable=_local_to_s3,
-#     op_kwargs={
-#         'filename': temp_filtered_user_purchase,
-#         'key': temp_filtered_user_purchase_key,
-#     },
-# )
+user_purchase_to_s3_stage = PythonOperator(
+    dag=dag,
+    task_id='user_purchase_to_s3_stage',
+    python_callable=_local_to_s3,
+    op_kwargs={
+        'filename': temp_filtered_user_purchase,
+        'key': temp_filtered_user_purchase_key,
+    },
+)
 
-# remove_local_user_purchase_file = PythonOperator(
-#     dag=dag,
-#     task_id='remove_local_user_purchase_file',
-#     python_callable=remove_local_file,
-#     op_kwargs={
-#         'filelocation': temp_filtered_user_purchase,
-#     },
-# )
+remove_local_user_purchase_file = PythonOperator(
+    dag=dag,
+    task_id='remove_local_user_purchase_file',
+    python_callable=remove_local_file,
+    op_kwargs={
+        'filelocation': temp_filtered_user_purchase,
+    },
+)
 
 movie_review_to_s3_stage = PythonOperator(
     dag=dag,
@@ -136,6 +149,24 @@ clean_movie_review_data = EmrStepSensor(
     depends_on_past=True
 )
 
+user_purchase_to_rs_stage = PythonOperator(
+    dag=dag,
+    task_id='user_purchase_to_rs_stage',
+    python_callable=run_redshift_external_query,
+    op_kwargs={
+        'qry': "alter table spectrum.user_purchase_staging add partition(insert_date='{{ ds }}') \
+            location 's3://etl-data-store/user_purchase/stage/{{ ds }}'",
+    },
+)
+
+get_user_behaviour = PostgresOperator(
+    dag=dag,
+    task_id='get_user_behaviour',
+    sql=get_user_behaviour,
+    postgres_conn_id='redshift'
+)
+
+pg_unload >> user_purchase_to_s3_stage >> remove_local_user_purchase_file >> user_purchase_to_rs_stage
 [movie_review_to_s3_stage, move_emr_script_to_s3] >> add_emr_steps >> clean_movie_review_data
-#pg_unload >> user_purchase_to_s3_stage >> remove_local_user_purchase_file >> end_of_data_pipeline 
+[user_purchase_to_rs_stage, clean_movie_review_data] >> get_user_behaviour >> end_of_data_pipeline
 
